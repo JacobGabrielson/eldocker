@@ -68,12 +68,48 @@ With prefix arg, force non-TTY mode (capture output, no terminal emulator)."
         (docker-exec--start-tty cfg cname exec-id)
       (docker-exec--start-non-tty cfg cname exec-id))))
 
+(defvar-local docker-exec--id nil
+  "Engine exec instance Id for this buffer (used by the resize hook).")
+(defvar-local docker-exec--config nil
+  "Docker config for this exec buffer (used by the resize hook).")
+(defvar-local docker-exec--last-dim nil
+  "Last (HEIGHT . WIDTH) we posted to /exec/{id}/resize.")
+
+(defun docker-exec--post-resize (cfg exec-id h w)
+  "POST a resize for EXEC-ID to (H, W).  Errors are swallowed."
+  (ignore-errors
+    (docker-engine-post cfg (format "/exec/%s/resize" exec-id)
+                        :query `(("h" . ,(format "%d" h))
+                                 ("w" . ,(format "%d" w))))))
+
+(defun docker-exec--maybe-resize (buf)
+  "Post a resize if BUF's window size differs from the last one we sent."
+  (when (buffer-live-p buf)
+    (with-current-buffer buf
+      (when (and docker-exec--id docker-exec--config)
+        (let* ((dim (docker-terminal-window-size buf))
+               (h (car dim)) (w (cdr dim)))
+          (unless (and docker-exec--last-dim
+                       (equal docker-exec--last-dim (cons h w)))
+            (setq docker-exec--last-dim (cons h w))
+            (docker-exec--post-resize docker-exec--config
+                                      docker-exec--id h w)))))))
+
+(defun docker-exec--window-size-change (frame)
+  "`window-size-change-functions' hook: resize every visible exec buffer."
+  (dolist (win (window-list frame))
+    (let ((buf (window-buffer win)))
+      (when (and (buffer-live-p buf)
+                 (buffer-local-value 'docker-exec--id buf))
+        (docker-exec--maybe-resize buf)))))
+
 (defun docker-exec--start-tty (cfg cname exec-id)
   "Launch a TTY exec into CNAME and host it in the configured terminal backend.
 The Upgrade-style hijack makes the same socket bidirectional: we feed
 the daemon's decoded body bytes through `term-emulate-terminal' for
 display, and let `term-char-mode' send the user's keystrokes back over
-the same process."
+the same process.  A `window-size-change-functions' hook keeps the
+remote PTY size in sync with the Emacs window."
   (let* ((bufname (format "*docker:exec:%s*" cname))
          (buf (docker-terminal-open bufname))
          (proc-ref (list nil))
@@ -89,17 +125,19 @@ the same process."
     ;; would reinstall a process filter, but docker-http-stream's filter
     ;; needs to stay in place to strip the response headers.
     (with-current-buffer buf
+      (setq docker-exec--id exec-id
+            docker-exec--config cfg
+            docker-exec--last-dim nil)
       (set-process-buffer proc buf)
       (set-marker (process-mark proc) (point-max))
       (term-char-mode))
-    ;; Best-effort initial resize so the remote PTY matches our window.
-    (let* ((dim (docker-terminal-window-size buf))
-           (h (car dim)) (w (cdr dim)))
-      (ignore-errors
-        (docker-engine-post cfg (format "/exec/%s/resize" exec-id)
-                            :query `(("h" . ,(format "%d" h))
-                                     ("w" . ,(format "%d" w))))))
+    ;; Register the global resize hook once; it filters per-buffer.
+    (add-hook 'window-size-change-functions
+              #'docker-exec--window-size-change)
     (pop-to-buffer buf)
+    ;; Best-effort initial resize once the buffer is in a window so
+    ;; `window-body-height/width' return real numbers.
+    (docker-exec--maybe-resize buf)
     buf))
 
 (defun docker-exec--start-non-tty (cfg cname exec-id)
