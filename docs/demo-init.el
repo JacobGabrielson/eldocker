@@ -13,11 +13,10 @@
 (setq package-load-list '(all))
 (package-initialize)
 
-;; Find the eldocker checkout containing THIS file.
-(add-to-list 'load-path
-             (file-name-directory
-              (directory-file-name
-               (file-name-directory (or load-file-name buffer-file-name)))))
+;; Locate the repo root and pick up the docker/ subdir.
+(let* ((this-dir (file-name-directory (or load-file-name buffer-file-name)))
+       (repo-root (file-name-directory (directory-file-name this-dir))))
+  (add-to-list 'load-path (expand-file-name "docker" repo-root)))
 (require 'docker)
 
 ;; Minimal cosmetic setup so the recording is uncluttered.

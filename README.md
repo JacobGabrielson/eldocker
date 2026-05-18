@@ -50,24 +50,51 @@ Three views ship today: `*docker:containers*`, `*docker:images*`,
 `*docker:networks*`.  Each subscribes to `/events` and refreshes
 automatically (debounced) on relevant changes.
 
+## Status: merging with emak8s
+
+This repo is in the middle of folding [emak8s](../emak8s) in so a
+single Emacs frontend covers both Docker daemons and Kubernetes
+clusters.  As of Phase A:
+
+- `M-x docker` — unchanged.
+- `M-x k8s` — works against your kubeconfig (kubeconfig path or `KUBECONFIG`).
+- `M-x eltainer` — picks one of the two backends (completing-read).
+- Sources live in `docker/` and `k8s/` subdirectories; `eltainer.el`
+  is the loader.  Phase B will lift the shared HTTP transport.
+
+See [docs/merge-emak8s.md](docs/merge-emak8s.md) for the plan.
+
 ## Architecture
 
 ```
-docker-http.el        HTTP/1.1 over unix / TCP / TCP+TLS (GnuTLS)
-docker-stream.el      8-byte multiplex demux + ndjson splitter
-docker-api.el         /vX.Y-prefixed engine GET / POST / DELETE
-docker-config.el      Daemon connection params
-docker-ps.el          Containers: list / inspect / lifecycle
-docker-images.el      Images: list / inspect / tag / remove
-docker-networks.el    Networks: list / inspect / connect / remove
-docker-events.el      Long-lived /events stream + pub/sub
-docker-logs.el        Streaming /containers/{id}/logs, demuxed
-docker-terminal.el    Backend picker: eat → vterm → term
-docker-exec.el        Upgrade-hijacked /exec/{id}/start, TTY in Emacs
-docker-auth.el        ~/.docker/config.json + docker-credential-* helpers
-docker-pull.el        Streamed /images/create with per-layer progress
-docker.el             magit-section views, transient dispatch, actions
-reload.el             Dev helper: byte-compile + reload + re-enter modes
+eltainer.el            Loader + `M-x eltainer'
+reload.el              Dev helper: byte-compile + reload both halves
+
+docker/
+  docker-http.el       HTTP/1.1 over unix / TCP / TCP+TLS (GnuTLS)
+  docker-stream.el     8-byte multiplex demux + ndjson splitter
+  docker-api.el        /vX.Y-prefixed engine GET / POST / DELETE
+  docker-config.el     Daemon connection params
+  docker-ps.el         Containers: list / inspect / lifecycle
+  docker-images.el     Images: list / inspect / tag / remove
+  docker-networks.el   Networks: list / inspect / connect / remove
+  docker-events.el     Long-lived /events stream + pub/sub
+  docker-logs.el       Streaming /containers/{id}/logs, demuxed
+  docker-terminal.el   Backend picker: eat → vterm → term
+  docker-exec.el       Upgrade-hijacked /exec/{id}/start, TTY in Emacs
+  docker-auth.el       ~/.docker/config.json + docker-credential-* helpers
+  docker-pull.el       Streamed /images/create with per-layer progress
+  docker.el            magit-section views, transient dispatch, actions
+
+k8s/
+  k8s-config.el        kubeconfig YAML parser (subset)
+  k8s-api.el           REST client over GnuTLS (Phase B: lift onto docker-http)
+  k8s-watch.el         Per-resource watch streams
+  k8s-pods.el          Pods view: phases, restarts, container statuses
+  k8s-fs.el            Pod-fs browser  (kubectl-exec underneath)
+  k8s-fs-ui.el         …its UI layer
+  k8s-exec.el          WebSocket exec into pods
+  k8s.el               Shared k8s magit-section views + transient
 ```
 
 ## Requirements
@@ -85,12 +112,14 @@ reload.el             Dev helper: byte-compile + reload + re-enter modes
 
 ```elisp
 (add-to-list 'load-path "/path/to/eldocker")
-(require 'docker)
+(require 'eltainer)               ; loads both docker/ and k8s/
 
-;; Then:
+;; Then any of:
+;;   M-x eltainer          ; prompt for backend
 ;;   M-x docker            ; containers view
 ;;   M-x docker-images     ; images
 ;;   M-x docker-networks   ; networks
+;;   M-x k8s               ; cluster pods view
 ```
 
 ## Demo

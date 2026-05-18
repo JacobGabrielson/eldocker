@@ -1,0 +1,408 @@
+;;; k8s-api.el --- Pure Elisp Kubernetes API client -*- lexical-binding: t -*-
+;;
+;; Talks to the Kubernetes API server over HTTPS.  Everything above the
+;; TLS layer is pure Elisp: kubeconfig parsing, auth, JSON handling,
+;; resource helpers.
+;;
+;; TLS transport: currently uses Emacs's built-in GnuTLS via `url.el'
+;; because the pure Elisp TLS stack (elisp-stdlib) is too slow for
+;; practical use — X25519 key exchange takes >60s due to Emacs bignum
+;; performance.  Once the stdlib gains faster field arithmetic (or we
+;; use Emacs's native bignums more effectively), switch to
+;; `tls-session-open'.
+;;
+;; Usage:
+;;   (setq conn (k8s-connection-open "/path/to/kubeconfig"))
+;;   (k8s-get conn "/api/v1/namespaces")
+
+(require 'cl-lib)
+(require 'json)
+(require 'url)
+(require 'url-http)
+(require 'gnutls)
+(require 'k8s-config)
+
+;;; ---------------------------------------------------------------------------
+;;; Connection struct
+
+(cl-defstruct (k8s-connection (:constructor k8s-connection--new) (:copier nil))
+  "Connection parameters for a Kubernetes API server."
+  config            ; k8s-config
+  cluster           ; k8s-cluster
+  user              ; k8s-user
+  server            ; string "https://host:port"
+  host              ; string
+  port              ; integer
+  ca-file            ; temp file path for the CA cert, or nil
+  client-cert-file   ; temp file path for client cert PEM, or nil
+  client-key-file)   ; temp file path for client key PEM, or nil
+
+;;; ---------------------------------------------------------------------------
+;;; Client-certificate authentication
+;;
+;; Docker Desktop and other clusters authenticate clients by certificate
+;; rather than bearer token. `url.el' has no direct hook for client certs,
+;; so we advise `gnutls-boot-parameters' to inject :keylist when this
+;; dynamic variable is bound.
+
+(defvar k8s--client-cert nil
+  "(KEY-FILE . CERT-FILE) for the in-flight TLS handshake, or nil.
+Bound dynamically around `url-retrieve-synchronously' calls so the
+GnuTLS handshake includes a client certificate.  Order matches GnuTLS's
+:keylist convention: key file first, certificate file second.")
+
+(defvar k8s-tls-priority "NORMAL:-VERS-TLS1.3"
+  "GnuTLS priority string used for K8s API connections.
+TLS 1.3 is disabled because Emacs's GnuTLS does not reliably present
+client certificates during a 1.3 handshake — the server then sees the
+request as `system:anonymous'.  TLS 1.2 with cert auth works correctly.")
+
+(defun k8s--gnutls-boot-parameters-advice (orig-fn &rest args)
+  "Inject `k8s--client-cert' as :keylist into GnuTLS boot parameters."
+  (let ((params (apply orig-fn args)))
+    (when k8s--client-cert
+      (setq params (plist-put params :keylist
+                              (list (list (car k8s--client-cert)
+                                          (cdr k8s--client-cert))))))
+    params))
+
+(advice-add 'gnutls-boot-parameters :around
+            #'k8s--gnutls-boot-parameters-advice)
+
+;;; ---------------------------------------------------------------------------
+;;; K8s API
+
+(defun k8s-connection-open (kubeconfig-path)
+  "Open a connection to the K8s cluster defined in KUBECONFIG-PATH.
+Returns a `k8s-connection' struct."
+  (let* ((config (k8s-config-load kubeconfig-path))
+         (cluster (k8s-config-resolve-cluster config))
+         (user (k8s-config-resolve-user config))
+         (server (k8s-cluster-server cluster))
+         (host-port (k8s--parse-url server))
+         ;; Write CA cert to temp file and add to GnuTLS trust store
+         (ca-pem (k8s-cluster-ca-cert-pem cluster))
+         (ca-file (when ca-pem
+                    (let ((f (make-temp-file "k8s-ca-" nil ".pem")))
+                      (with-temp-file f
+                        (set-buffer-multibyte nil)
+                        (insert ca-pem))
+                      (cl-pushnew f gnutls-trustfiles :test #'string=)
+                      f)))
+         ;; Write client cert and key to temp files (for cert-based auth)
+         (cert-pem (k8s-user-client-cert-pem user))
+         (key-pem (k8s-user-client-key-pem user))
+         (client-cert-file
+          (when cert-pem
+            (let ((f (make-temp-file "k8s-cert-" nil ".pem")))
+              (with-temp-file f (set-buffer-multibyte nil) (insert cert-pem))
+              (set-file-modes f #o600)
+              f)))
+         (client-key-file
+          (when key-pem
+            (let ((f (make-temp-file "k8s-key-" nil ".pem")))
+              (with-temp-file f (set-buffer-multibyte nil) (insert key-pem))
+              (set-file-modes f #o600)
+              f))))
+    (message "emak8s: connecting to %s:%d ..." (car host-port) (cdr host-port))
+    (k8s-connection--new
+     :config config
+     :cluster cluster
+     :user user
+     :server server
+     :host (car host-port)
+     :port (cdr host-port)
+     :ca-file ca-file
+     :client-cert-file client-cert-file
+     :client-key-file client-key-file)))
+
+(defun k8s--do-get (url)
+  "Perform a single GET to URL, return parsed JSON or nil on failure."
+  (message "emak8s: GET %s ..." (replace-regexp-in-string "\\?.*" "" url))
+  (let* ((start (float-time))
+         (buf (url-retrieve-synchronously url t nil 60))
+         (elapsed (- (float-time) start)))
+    (message "emak8s: GET %s ... %.1fs %s"
+             (replace-regexp-in-string "\\?.*" "" url)
+             elapsed
+             (if buf "ok" "TIMEOUT"))
+    (when buf
+      (unwind-protect
+          (with-current-buffer buf
+            (goto-char (point-min))
+            (when (re-search-forward "\n\n" nil t)
+              (condition-case nil
+                  (let* ((json-object-type 'alist)
+                         (json-array-type 'vector)
+                         (json-key-type 'symbol))
+                    (json-read))
+                (json-end-of-file
+                 (message "emak8s: GET %s ... truncated response"
+                          (replace-regexp-in-string "\\?.*" "" url))
+                 nil))))
+        (kill-buffer buf)))))
+
+(defun k8s-get (conn path)
+  "Perform a GET request to PATH on the K8s API via CONN.
+Returns the parsed JSON response as an alist.
+Retries once on transient failures (truncated response, timeout)."
+  (let* ((server (k8s-connection-server conn))
+         (url (concat server path))
+         (user (k8s-connection-user conn))
+         (cert-file (k8s-connection-client-cert-file conn))
+         (key-file (k8s-connection-client-key-file conn))
+         ;; Set auth headers
+         (url-request-extra-headers
+          (append
+           (when (k8s-user-token user)
+             (list (cons "Authorization"
+                         (format "Bearer %s" (k8s-user-token user)))))
+           '(("Accept" . "application/json")
+             ("User-Agent" . "emak8s/0.1"))))
+         ;; Disable cert verification for self-signed cluster certs
+         (gnutls-verify-error nil)
+         (network-security-level 'low)
+         (url-http-attempt-keepalives nil)
+         (url-gateway-method 'native)
+         ;; Inject client cert into the TLS handshake (Docker Desktop, etc.)
+         (k8s--client-cert (and cert-file key-file (cons key-file cert-file)))
+         (gnutls-algorithm-priority k8s-tls-priority))
+    (or (k8s--do-get url)
+        ;; Retry once on failure
+        (progn
+          (message "emak8s: retrying %s ..." path)
+          (k8s--do-get url))
+        (error "K8s API request failed: %s" path))))
+
+(defun k8s-delete (conn path)
+  "Perform a DELETE request to PATH on the K8s API via CONN.
+Returns the parsed JSON response."
+  (let* ((server (k8s-connection-server conn))
+         (url (concat server path))
+         (user (k8s-connection-user conn))
+         (cert-file (k8s-connection-client-cert-file conn))
+         (key-file (k8s-connection-client-key-file conn))
+         (url-request-method "DELETE")
+         (url-request-extra-headers
+          (append
+           (when (k8s-user-token user)
+             (list (cons "Authorization"
+                         (format "Bearer %s" (k8s-user-token user)))))
+           '(("Accept" . "application/json")
+             ("User-Agent" . "emak8s/0.1"))))
+         (gnutls-verify-error nil)
+         (network-security-level 'low)
+         (url-http-attempt-keepalives nil)
+         (url-gateway-method 'native)
+         (k8s--client-cert (and cert-file key-file (cons key-file cert-file)))
+         (gnutls-algorithm-priority k8s-tls-priority))
+    (message "emak8s: DELETE %s ..." path)
+    (let ((buf (url-retrieve-synchronously url t nil 60)))
+      (when buf
+        (unwind-protect
+            (with-current-buffer buf
+              (goto-char (point-min))
+              (when (re-search-forward "\n\n" nil t)
+                (condition-case nil
+                    (let* ((json-object-type 'alist)
+                           (json-array-type 'vector)
+                           (json-key-type 'symbol))
+                      (json-read))
+                  (json-end-of-file nil))))
+          (kill-buffer buf))))))
+
+(defvar k8s--list-api-paths
+  '((pods         "/api/v1/pods"
+                  "/api/v1/namespaces/%s/pods")
+    (deployments  "/apis/apps/v1/deployments"
+                  "/apis/apps/v1/namespaces/%s/deployments")
+    (services     "/api/v1/services"
+                  "/api/v1/namespaces/%s/services")
+    (statefulsets "/apis/apps/v1/statefulsets"
+                  "/apis/apps/v1/namespaces/%s/statefulsets")
+    (daemonsets   "/apis/apps/v1/daemonsets"
+                  "/apis/apps/v1/namespaces/%s/daemonsets")
+    (jobs         "/apis/batch/v1/jobs"
+                  "/apis/batch/v1/namespaces/%s/jobs")
+    (cronjobs     "/apis/batch/v1/cronjobs"
+                  "/apis/batch/v1/namespaces/%s/cronjobs")
+    (configmaps   "/api/v1/configmaps"
+                  "/api/v1/namespaces/%s/configmaps")
+    (secrets      "/api/v1/secrets"
+                  "/api/v1/namespaces/%s/secrets")
+    (ingresses    "/apis/networking.k8s.io/v1/ingresses"
+                  "/apis/networking.k8s.io/v1/namespaces/%s/ingresses"))
+  "Alist mapping resource types (plural) to (ALL-PATH NAMESPACED-PATH-TEMPLATE).
+Keys are plural to match `k8s--define-view's macro name convention.")
+
+(defun k8s--list-path (type &optional namespace)
+  "Return the API list path for resource TYPE, optionally in NAMESPACE."
+  (let ((entry (cdr (assq type k8s--list-api-paths))))
+    (if namespace
+        (format (cadr entry) namespace)
+      (car entry))))
+
+(defvar k8s--resource-api-paths
+  '((pod         . "/api/v1/namespaces/%s/pods/%s")
+    (deployment  . "/apis/apps/v1/namespaces/%s/deployments/%s")
+    (service     . "/api/v1/namespaces/%s/services/%s")
+    (statefulset . "/apis/apps/v1/namespaces/%s/statefulsets/%s")
+    (daemonset   . "/apis/apps/v1/namespaces/%s/daemonsets/%s")
+    (job         . "/apis/batch/v1/namespaces/%s/jobs/%s")
+    (cronjob     . "/apis/batch/v1/namespaces/%s/cronjobs/%s")
+    (configmap   . "/api/v1/namespaces/%s/configmaps/%s")
+    (secret      . "/api/v1/namespaces/%s/secrets/%s")
+    (ingress     . "/apis/networking.k8s.io/v1/namespaces/%s/ingresses/%s"))
+  "Alist mapping section types to API path templates (namespace, name).")
+
+(defun k8s-delete-resource (conn type namespace name)
+  "Delete resource of TYPE named NAME in NAMESPACE via CONN."
+  (let ((template (cdr (assq type k8s--resource-api-paths))))
+    (unless template
+      (error "Don't know how to delete %s" type))
+    (k8s-delete conn (format template namespace name))))
+
+(defun k8s-get-text (conn path)
+  "Perform a GET request to PATH on the K8s API via CONN.
+Returns the raw response body as a string (for non-JSON endpoints like logs)."
+  (let* ((server (k8s-connection-server conn))
+         (url (concat server path))
+         (user (k8s-connection-user conn))
+         (cert-file (k8s-connection-client-cert-file conn))
+         (key-file (k8s-connection-client-key-file conn))
+         (url-request-extra-headers
+          (append
+           (when (k8s-user-token user)
+             (list (cons "Authorization"
+                         (format "Bearer %s" (k8s-user-token user)))))
+           '(("Accept" . "text/plain")
+             ("User-Agent" . "emak8s/0.1"))))
+         (gnutls-verify-error nil)
+         (network-security-level 'low)
+         (url-http-attempt-keepalives nil)
+         (url-gateway-method 'native)
+         (k8s--client-cert (and cert-file key-file (cons key-file cert-file)))
+         (gnutls-algorithm-priority k8s-tls-priority)
+         (buf (url-retrieve-synchronously url t nil 60)))
+    (when buf
+      (unwind-protect
+          (with-current-buffer buf
+            (goto-char (point-min))
+            (when (re-search-forward "\n\n" nil t)
+              (buffer-substring-no-properties (point) (point-max))))
+        (kill-buffer buf)))))
+
+(defun k8s-pod-logs (conn namespace name &optional tail-lines container)
+  "Fetch logs for pod NAME in NAMESPACE via CONN.
+Returns log text as a string.  TAIL-LINES limits to last N lines.
+CONTAINER specifies which container (required for multi-container pods)."
+  (let* ((params (list (format "tailLines=%d" (or tail-lines 100))))
+         (_ (when container
+              (push (format "container=%s" container) params)))
+         (query (mapconcat #'identity params "&"))
+         (path (format "/api/v1/namespaces/%s/pods/%s/log?%s"
+                       namespace name query)))
+    (or (k8s-get-text conn path) "")))
+
+;;; ---------------------------------------------------------------------------
+;;; Convenience functions
+
+(defun k8s-list-namespaces (conn)
+  "List all namespaces via CONN.  Returns a vector of namespace alists."
+  (cdr (assq 'items (k8s-get conn "/api/v1/namespaces"))))
+
+(defun k8s-list-pods (conn &optional namespace)
+  "List pods via CONN, optionally in NAMESPACE."
+  (let ((path (if namespace
+                  (format "/api/v1/namespaces/%s/pods" namespace)
+                "/api/v1/pods")))
+    (cdr (assq 'items (k8s-get conn path)))))
+
+(defun k8s-list-deployments (conn &optional namespace)
+  "List deployments via CONN, optionally in NAMESPACE."
+  (let ((path (if namespace
+                  (format "/apis/apps/v1/namespaces/%s/deployments" namespace)
+                "/apis/apps/v1/deployments")))
+    (cdr (assq 'items (k8s-get conn path)))))
+
+(defun k8s-list-services (conn &optional namespace)
+  "List services via CONN, optionally in NAMESPACE."
+  (let ((path (if namespace
+                  (format "/api/v1/namespaces/%s/services" namespace)
+                "/api/v1/services")))
+    (cdr (assq 'items (k8s-get conn path)))))
+
+(defun k8s-list-statefulsets (conn &optional namespace)
+  "List statefulsets via CONN, optionally in NAMESPACE."
+  (let ((path (if namespace
+                  (format "/apis/apps/v1/namespaces/%s/statefulsets" namespace)
+                "/apis/apps/v1/statefulsets")))
+    (cdr (assq 'items (k8s-get conn path)))))
+
+(defun k8s-list-daemonsets (conn &optional namespace)
+  "List daemonsets via CONN, optionally in NAMESPACE."
+  (let ((path (if namespace
+                  (format "/apis/apps/v1/namespaces/%s/daemonsets" namespace)
+                "/apis/apps/v1/daemonsets")))
+    (cdr (assq 'items (k8s-get conn path)))))
+
+(defun k8s-list-jobs (conn &optional namespace)
+  "List jobs via CONN, optionally in NAMESPACE."
+  (let ((path (if namespace
+                  (format "/apis/batch/v1/namespaces/%s/jobs" namespace)
+                "/apis/batch/v1/jobs")))
+    (cdr (assq 'items (k8s-get conn path)))))
+
+(defun k8s-list-cronjobs (conn &optional namespace)
+  "List cronjobs via CONN, optionally in NAMESPACE."
+  (let ((path (if namespace
+                  (format "/apis/batch/v1/namespaces/%s/cronjobs" namespace)
+                "/apis/batch/v1/cronjobs")))
+    (cdr (assq 'items (k8s-get conn path)))))
+
+(defun k8s-list-configmaps (conn &optional namespace)
+  "List configmaps via CONN, optionally in NAMESPACE."
+  (let ((path (if namespace
+                  (format "/api/v1/namespaces/%s/configmaps" namespace)
+                "/api/v1/configmaps")))
+    (cdr (assq 'items (k8s-get conn path)))))
+
+(defun k8s-list-secrets (conn &optional namespace)
+  "List secrets via CONN, optionally in NAMESPACE."
+  (let ((path (if namespace
+                  (format "/api/v1/namespaces/%s/secrets" namespace)
+                "/api/v1/secrets")))
+    (cdr (assq 'items (k8s-get conn path)))))
+
+(defun k8s-list-ingresses (conn &optional namespace)
+  "List ingresses via CONN, optionally in NAMESPACE."
+  (let ((path (if namespace
+                  (format "/apis/networking.k8s.io/v1/namespaces/%s/ingresses"
+                          namespace)
+                "/apis/networking.k8s.io/v1/ingresses")))
+    (cdr (assq 'items (k8s-get conn path)))))
+
+(defun k8s-get-resource (conn path)
+  "GET a single resource at PATH via CONN."
+  (k8s-get conn path))
+
+(defun k8s--extract-resource-version (response)
+  "Return metadata.resourceVersion from a list RESPONSE."
+  (cdr (assq 'resourceVersion (cdr (assq 'metadata response)))))
+
+(defun k8s-list-events (conn namespace &optional field-selector)
+  "List events in NAMESPACE via CONN, optionally filtered by FIELD-SELECTOR."
+  (let* ((query (if field-selector
+                    (format "?fieldSelector=%s"
+                            (url-hexify-string field-selector))
+                  ""))
+         (path (format "/api/v1/namespaces/%s/events%s" namespace query)))
+    (cdr (assq 'items (k8s-get conn path)))))
+
+;;; ---------------------------------------------------------------------------
+;;; Error condition
+
+(define-error 'k8s-api-error "Kubernetes API error")
+
+(provide 'k8s-api)
+;;; k8s-api.el ends here
