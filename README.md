@@ -137,8 +137,7 @@ WebSockets is the natural next consumer of `eltainer-terminal`.
 - Emacs 30+ with native JSON (`json-parse-string`) and, for any TLS
   target, GnuTLS (`gnutls-available-p`).  eltainer refuses to load
   without the former and refuses to TLS-connect without the latter.
-- `magit-section`, `transient`.  `company` for the k8s namespace
-  picker.
+- `magit-section`, `transient`.
 - A running Docker daemon and / or a kubeconfig.
 - Optional but recommended for TTY exec:
   [`eat`](https://codeberg.org/akib/emacs-eat) (`M-x package-install

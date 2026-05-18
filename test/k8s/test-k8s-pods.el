@@ -11,7 +11,7 @@
   (add-to-list 'load-path (expand-file-name "k8s" repo-root))
   (add-to-list 'load-path (expand-file-name "docker" repo-root)))
 
-;; magit-section, transient, company are pulled in by the user's ~/.emacs.d/elpa.
+;; magit-section, transient are pulled in by the user's ~/.emacs.d/elpa.
 (package-initialize)
 
 (require 'k8s-pods)
