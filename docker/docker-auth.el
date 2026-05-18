@@ -16,6 +16,7 @@
 
 (require 'cl-lib)
 (require 'json)
+(require 'eltainer-shell-helper)
 
 (defcustom docker-auth-config-path
   (expand-file-name "~/.docker/config.json")
@@ -53,30 +54,10 @@
     (or specific default)))
 
 (defun docker-auth--run-helper (helper registry)
-  "Run docker-credential-HELPER `get' for REGISTRY.  Returns the parsed JSON, or nil."
-  (let* ((bin (format "docker-credential-%s" helper))
-         (output (with-temp-buffer
-                   (let ((process-environment process-environment))
-                     ;; Some helpers (osxkeychain) won't talk to TTY-less callers.
-                     (when (call-process bin nil t nil "get"
-                                         :input-string registry)
-                       (buffer-string))))))
-    ;; `call-process' doesn't have :input-string; use a temp file path.
-    ;; Re-implement with `process-file' + stdin pipe:
-    (ignore output)
-    (with-temp-buffer
-      (let ((stdout (current-buffer)))
-        (with-temp-buffer
-          (insert registry)
-          (call-process-region (point-min) (point-max) bin nil stdout nil "get"))
-        (let ((s (buffer-string)))
-          (when (and (> (length s) 0)
-                     (string-prefix-p "{" (string-trim s)))
-            (json-parse-string s
-                               :object-type 'alist
-                               :array-type 'list
-                               :null-object nil
-                               :false-object :false)))))))
+  "Run docker-credential-HELPER `get' for REGISTRY.  Returns the parsed
+JSON `((Username . …) (Secret . …) …)' alist, or nil on any failure."
+  (eltainer-shell-helper-json
+   (format "docker-credential-%s" helper) '("get") registry))
 
 (defun docker-auth--inline-auth (cfg-alist registry)
   "Look up an inline `{auth: \"base64\"}` entry in CFG-ALIST for REGISTRY."

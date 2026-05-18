@@ -20,6 +20,7 @@
 (add-to-list 'load-path (expand-file-name "k8s"    eltainer--source-dir))
 
 (require 'eltainer-terminal)
+(require 'eltainer-shell-helper)
 (require 'docker)
 (require 'k8s)
 

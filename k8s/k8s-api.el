@@ -12,6 +12,7 @@
 (require 'cl-lib)
 (require 'docker-config)
 (require 'docker-http)
+(require 'eltainer-shell-helper)
 (require 'k8s-config)
 
 ;;; ---------------------------------------------------------------------------
@@ -58,7 +59,8 @@ in its `docker-cfg' slot — all subsequent requests go through
          (key-pem (k8s-user-client-key-pem user))
          (client-cert-file (k8s-api--temp-pem "k8s-cert-" cert-pem t))
          (client-key-file (k8s-api--temp-pem "k8s-key-" key-pem t))
-         (token (k8s-user-token user))
+         (token (or (k8s-user-token user)
+                    (k8s-api--exec-token user)))
          (docker-cfg
           (docker-config--new
            :host host
@@ -88,6 +90,26 @@ in its `docker-cfg' slot — all subsequent requests go through
      :client-cert-file client-cert-file
      :client-key-file client-key-file
      :docker-cfg docker-cfg)))
+
+(defun k8s-api--exec-token (user)
+  "Run USER's `exec' plugin, if any, and return the bearer token it emits.
+
+Plugins like `aws eks get-token' or `gke-gcloud-auth-plugin' implement
+the client-go ExecCredential protocol: stdout is a JSON
+`{ \"kind\": \"ExecCredential\", \"status\": { \"token\": \"…\" } }'.
+Returns nil if no exec section is present, the binary isn't on PATH,
+the helper exits non-zero, or the JSON is malformed."
+  (when-let* ((exec (k8s-user-exec user))
+              (command (cdr (assoc "command" exec))))
+    (let* ((args (cdr (assoc "args" exec)))
+           (env-list (cdr (assoc "env" exec)))
+           (env (mapcar (lambda (e)
+                          (cons (cdr (assoc "name" e))
+                                (cdr (assoc "value" e))))
+                        env-list))
+           (result (eltainer-shell-helper-json command args nil :env env)))
+      (and result
+           (cdr (assoc 'token (cdr (assoc 'status result))))))))
 
 (defun k8s-api--temp-pem (prefix pem &optional restrict-mode)
   "Write PEM (a string) to a temp file with PREFIX and return its path."

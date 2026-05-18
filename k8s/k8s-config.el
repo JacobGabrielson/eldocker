@@ -33,7 +33,10 @@
   name              ; string
   token             ; string  bearer token, or nil
   client-cert-pem   ; string  decoded PEM, or nil
-  client-key-pem)   ; string  decoded PEM, or nil
+  client-key-pem    ; string  decoded PEM, or nil
+  exec)             ; alist   exec-plugin config (command, args, env), or nil
+                    ; — resolved to a token at connection time via
+                    ;   `eltainer-shell-helper-json'.
 
 (cl-defstruct (k8s-context (:constructor k8s-context--new) (:copier nil))
   "A context entry from kubeconfig."
@@ -236,12 +239,14 @@ Handles https://host:port format."
          (cert-data (cdr (assoc "client-certificate-data" user)))
          (key-data (cdr (assoc "client-key-data" user)))
          (cert-pem (when cert-data (base64-decode-string cert-data)))
-         (key-pem (when key-data (base64-decode-string key-data))))
+         (key-pem (when key-data (base64-decode-string key-data)))
+         (exec (cdr (assoc "exec" user))))
     (k8s-user--new
      :name name
      :token token
      :client-cert-pem cert-pem
-     :client-key-pem key-pem)))
+     :client-key-pem key-pem
+     :exec exec)))
 
 (defun k8s--build-context (entry)
   "Build a `k8s-context' from a parsed kubeconfig context ENTRY alist."
