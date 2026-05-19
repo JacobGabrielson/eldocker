@@ -39,16 +39,25 @@
        "Pull an image by reference, with live progress.")))
     ("Kubernetes" .
      (("k" "Pods"          k8s-pods
-       "Pods view grouped by namespace.")
-      ("d" "Deployments"   k8s-deployments)
-      ("s" "Services"      k8s-services)
-      ("S" "StatefulSets"  k8s-statefulsets)
-      ("D" "DaemonSets"    k8s-daemonsets)
-      ("j" "Jobs"          k8s-jobs)
-      ("J" "CronJobs"      k8s-cronjobs)
-      ("i" "Ingresses"     k8s-ingresses)
-      ("m" "ConfigMaps"    k8s-configmaps)
-      ("x" "Secrets"       k8s-secrets))))
+       "Pods grouped by namespace; l streams logs, w toggles watch.")
+      ("d" "Deployments"   k8s-deployments
+       "Workload deployments with ready/available replica counts.")
+      ("s" "Services"      k8s-services
+       "Services with cluster-IP, type, and port mappings.")
+      ("S" "StatefulSets"  k8s-statefulsets
+       "Stateful workloads with ordered replicas + volume claims.")
+      ("D" "DaemonSets"    k8s-daemonsets
+       "Per-node DaemonSets and their rollout state.")
+      ("j" "Jobs"          k8s-jobs
+       "One-shot Jobs and their completion status.")
+      ("J" "CronJobs"      k8s-cronjobs
+       "Scheduled CronJobs and their last/next run times.")
+      ("i" "Ingresses"     k8s-ingresses
+       "Ingresses with their hosts, paths, and backends.")
+      ("m" "ConfigMaps"    k8s-configmaps
+       "ConfigMaps; expand to peek at key/value pairs.")
+      ("x" "Secrets"       k8s-secrets
+       "Secrets (metadata only — values stay redacted)."))))
   "Dashboard entries.  Alist of (BACKEND-LABEL . ((KEY LABEL COMMAND [BLURB]) …)).")
 
 (defvar-keymap eltainer-mode-map
@@ -56,7 +65,97 @@
   "q" #'quit-window
   "g" #'eltainer-refresh
   "?" #'describe-mode
+  "b" #'eltainer-switch-kubeconfig
   "RET" #'eltainer-dwim-ret)
+
+;;; ---------------------------------------------------------------------------
+;;; Kubeconfig switching (magit-branch-style `b')
+
+(defcustom eltainer-kubeconfig-extra-paths nil
+  "Additional kubeconfig paths to offer alongside the auto-discovered ones.
+Each entry is an absolute file path."
+  :type '(repeat file)
+  :group 'eltainer)
+
+(defcustom eltainer-kubeconfig-search-dirs
+  '("~/.kube" "~/.kube/configs")
+  "Directories scanned for kubeconfig files.
+Files matching `config' or `config-*' in any of these are offered as
+switch targets in the dashboard."
+  :type '(repeat directory)
+  :group 'eltainer)
+
+(defun eltainer--discover-kubeconfigs ()
+  "Return the de-duplicated list of kubeconfig paths to offer.
+Sources, in order: `$KUBECONFIG' (colon-separated), files in
+`eltainer-kubeconfig-search-dirs', and `eltainer-kubeconfig-extra-paths'.
+Only existing readable files are included."
+  (let* ((env (getenv "KUBECONFIG"))
+         (env-paths (and env (split-string env ":" t)))
+         (dir-paths
+          (cl-loop for dir in eltainer-kubeconfig-search-dirs
+                   for expanded = (expand-file-name dir)
+                   when (file-directory-p expanded)
+                   append (directory-files expanded t
+                                           "\\`config\\(?:-.*\\)?\\'" t)))
+         (all (append env-paths dir-paths eltainer-kubeconfig-extra-paths))
+         seen out)
+    (dolist (p all)
+      (let ((full (and p (expand-file-name p))))
+        (when (and full
+                   (file-readable-p full)
+                   (not (file-directory-p full))
+                   (not (member full seen)))
+          (push full seen)
+          (push full out))))
+    (nreverse out)))
+
+(defun eltainer--current-kubeconfig ()
+  "Return the path eltainer is currently pointed at for k8s, or nil."
+  (or (bound-and-true-p k8s-kubeconfig-path)
+      (let ((env (getenv "KUBECONFIG")))
+        (and env (car (split-string env ":" t))))
+      (let ((default (expand-file-name "~/.kube/config")))
+        (and (file-readable-p default) default))))
+
+(defun eltainer--kubeconfig-context (path)
+  "Return the `current-context' string from PATH, or nil on any failure."
+  (when (and path (file-readable-p path))
+    (condition-case nil
+        (k8s-config-current-context (k8s-config-load path))
+      (error nil))))
+
+(defun eltainer--kill-k8s-buffers ()
+  "Kill every live `*k8s:…*' buffer so a kubeconfig switch is clean."
+  (let ((kill-buffer-query-functions nil))
+    (dolist (buf (buffer-list))
+      (when (string-prefix-p "*k8s:" (buffer-name buf))
+        (ignore-errors (kill-buffer buf))))))
+
+(defun eltainer-switch-kubeconfig ()
+  "Switch the active k8s kubeconfig and refresh the dashboard.
+Like magit's branch switch (`b'), but for clusters.  Closes any open
+`*k8s:…*' buffers so they re-open against the new config."
+  (interactive)
+  (let* ((current (eltainer--current-kubeconfig))
+         (candidates (eltainer--discover-kubeconfigs))
+         (annotated
+          (mapcar (lambda (p)
+                    (let ((ctx (eltainer--kubeconfig-context p)))
+                      (cons (format "%s%s%s"
+                                    (abbreviate-file-name p)
+                                    (if ctx (format "  (%s)" ctx) "")
+                                    (if (equal p current) "  *current*" ""))
+                            p)))
+                  candidates))
+         (choice (completing-read "Switch kubeconfig: " annotated nil t))
+         (target (cdr (assoc choice annotated))))
+    (unless target (user-error "No kubeconfig selected"))
+    (setq k8s-kubeconfig-path target)
+    (eltainer--kill-k8s-buffers)
+    (when (get-buffer "*eltainer*")
+      (with-current-buffer "*eltainer*" (eltainer-refresh)))
+    (message "eltainer: switched to %s" (abbreviate-file-name target))))
 
 (define-derived-mode eltainer-mode magit-section-mode "Eltainer"
   "Dashboard for the unified docker + k8s frontend."
@@ -99,6 +198,23 @@
         (add-text-properties start (point)
                              '(help-echo "command unavailable (module not loaded)"))))))
 
+(defun eltainer--insert-active-kubeconfig ()
+  "Render a `Kubeconfig: PATH (context)' line with a hint about `b'."
+  (let* ((path (eltainer--current-kubeconfig))
+         (ctx (and path (eltainer--kubeconfig-context path))))
+    (insert (propertize "Kubeconfig:  " 'font-lock-face 'eltainer-dim))
+    (if path
+        (progn
+          (insert (propertize (abbreviate-file-name path)
+                              'font-lock-face 'eltainer-resource-name))
+          (when ctx
+            (insert (propertize (format " (%s)" ctx)
+                                'font-lock-face 'eltainer-resource-secondary))))
+      (insert (propertize "(none — set k8s-kubeconfig-path or $KUBECONFIG)"
+                          'font-lock-face 'eltainer-dim)))
+    (insert (propertize "    [b] switch\n\n"
+                        'font-lock-face 'eltainer-dim))))
+
 (defun eltainer-refresh ()
   "(Re)render the dashboard buffer."
   (interactive)
@@ -107,6 +223,7 @@
     (magit-insert-section (eltainer-root)
       (insert (propertize "eltainer" 'font-lock-face 'eltainer-section-heading)
               " — unified container porcelain\n\n")
+      (eltainer--insert-active-kubeconfig)
       (insert (propertize "Press the key beside an entry, or RET on a row.\n"
                           'font-lock-face 'eltainer-dim))
       (insert (propertize "g refreshes, q quits.\n\n"
